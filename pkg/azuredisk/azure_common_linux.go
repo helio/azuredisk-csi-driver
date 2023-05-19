@@ -120,6 +120,9 @@ func findDiskByLun(lun int, io azureutils.IOHandler, _ *mount.SafeFormatAndMount
 }
 
 func formatAndMount(source, target, fstype string, options []string, m *mount.SafeFormatAndMount) error {
+	if fstype == "ntfs" {
+		return m.FormatAndMountSensitiveWithFormatOptions(source, target, fstype, options, nil, []string{"-F", "-f"})
+	}
 	return m.FormatAndMount(source, target, fstype, options)
 }
 
