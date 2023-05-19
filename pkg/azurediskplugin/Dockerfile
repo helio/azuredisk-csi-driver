@@ -12,9 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 FROM registry.k8s.io/build-image/debian-base:bookworm-v1.0.5
 
-RUN apt update && apt upgrade -y && apt-mark unhold libcap2 && clean-install util-linux e2fsprogs mount ca-certificates udev xfsprogs btrfs-progs
+RUN apt update && apt upgrade -y && apt-mark unhold libcap2 && clean-install util-linux e2fsprogs mount ca-certificates udev xfsprogs btrfs-progs ntfs-3g ntfs-3g-progs
 
 LABEL maintainers="andyzhangx"
 LABEL description="Azure Disk CSI Driver"
