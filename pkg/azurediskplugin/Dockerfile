@@ -14,7 +14,7 @@
 
 FROM alpine:3.18.9
 RUN apk upgrade --available --no-cache && \
-    apk add --no-cache util-linux e2fsprogs e2fsprogs-extra ca-certificates udev xfsprogs xfsprogs-extra btrfs-progs btrfs-progs-extra ntfs-3g ntfs-3g-progs
+    apk add --no-cache util-linux e2fsprogs e2fsprogs-extra ca-certificates udev xfsprogs xfsprogs-extra btrfs-progs btrfs-progs-extra ntfs-3g ntfs-3g-progs parted
 
 LABEL maintainers="andyzhangx"
 LABEL description="Azure Disk CSI Driver"

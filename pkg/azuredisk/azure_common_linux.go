@@ -23,6 +23,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -121,9 +122,50 @@ func findDiskByLun(lun int, io azureutils.IOHandler, _ *mount.SafeFormatAndMount
 
 func formatAndMount(source, target, fstype string, options []string, m *mount.SafeFormatAndMount) error {
 	if fstype == "ntfs" {
-		return m.FormatAndMountSensitiveWithFormatOptions(source, target, fstype, options, nil, []string{"-F", "-f"})
+		partedSource, err := windowsPartitionCompat(source)
+		if err != nil {
+			return err
+		}
+
+		return m.FormatAndMountSensitiveWithFormatOptions(partedSource, target, fstype, options, nil, []string{"-F", "-f"})
 	}
 	return m.FormatAndMount(source, target, fstype, options)
+}
+
+func windowsPartitionCompat(source string) (string, error) {
+	// windows code does not care about partitions but takes the first entry
+	partedSource := source + "-part1"
+	// check if partition exists
+	cmd := exec.Command("parted", "-s", source, "print", "1")
+	cmd.Env = os.Environ()
+	err := cmd.Run()
+	if err == nil {
+		return partedSource, nil
+	} else {
+		_, ok := err.(*exec.ExitError)
+		if !ok {
+			return partedSource, fmt.Errorf("failed to get partition %s, err %v", source, err)
+		}
+	}
+
+	// label disk
+	cmd = exec.Command("parted", "-a", "optimal", "-s", source, "mklabel", "gpt")
+	cmd.Env = os.Environ()
+	err = cmd.Run()
+	if err != nil {
+		return partedSource, fmt.Errorf("failed to label device %s, err %v", source, err)
+	}
+
+	// create partition
+
+	cmd = exec.Command("parted", "-a", "optimal", "-s", source, "mkpart", "primary", "ntfs", "0%", "100%")
+	cmd.Env = os.Environ()
+	err = cmd.Run()
+	if err != nil {
+		return partedSource, fmt.Errorf("failed to create partition on %s, err %v", source, err)
+	}
+
+	return partedSource, nil
 }
 
 // finds a device mounted to "current" node
