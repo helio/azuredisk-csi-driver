@@ -56,6 +56,8 @@ func ListDiskLocations() (map[uint32]Location, error) {
 		return nil, fmt.Errorf("failed to list disk location. cmd: %q, output: %q, err %v", cmd, string(out), err)
 	}
 
+	klog.V(5).Info("ListDiskLocations", "output", string(out))
+
 	var getDisk []map[string]interface{}
 	err = json.Unmarshal(out, &getDisk)
 	if err != nil {
