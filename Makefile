@@ -204,7 +204,7 @@ endif
 # Set --provenance=false to not generate the provenance (which is what causes the multi-platform index to be generated, even for a single platform).
 .PHONY: container-windows-hostprocess
 container-windows-hostprocess:
-	docker buildx build --pull --output=type=$(OUTPUT_TYPE) --platform="windows/$(ARCH)" --provenance=false --sbom=false \
+	docker buildx build --pull --output=type=$(OUTPUT_TYPE) --platform="windows/$(ARCH)" \
 		-t $(CSI_IMAGE_TAG)-windows-hp -f ./pkg/azurediskplugin/WindowsHostProcess.Dockerfile .
 
 .PHONY: container-windows-hostprocess-latest

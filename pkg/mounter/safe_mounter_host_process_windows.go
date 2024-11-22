@@ -207,6 +207,9 @@ func (mounter *winMounter) Rescan() error {
 // FindDiskByLun - given a lun number, find out the corresponding disk
 func (mounter *winMounter) FindDiskByLun(lun string) (diskNum string, err error) {
 	diskLocations, err := disk.ListDiskLocations()
+
+	klog.V(5).Info("winMounter.FindDiskByLun", "diskLocations", diskLocations, "err", err, "lun", lun)
+
 	if err != nil {
 		return "", err
 	}
@@ -215,6 +218,7 @@ func (mounter *winMounter) FindDiskByLun(lun string) (diskNum string, err error)
 	// If match is found then return back the disk number.
 	for diskID, location := range diskLocations {
 		if strings.EqualFold(location.LUNID, lun) {
+			klog.V(5).Info("winMounter.FindDiskByLun.EqualFoldFound", "diskLocations", diskLocations, "err", err, "lun", lun, "diskID", diskID)
 			return strconv.Itoa(int(diskID)), nil
 		}
 	}
