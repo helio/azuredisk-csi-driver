@@ -86,7 +86,7 @@ verify: unit-test
 	go build -o _output/${ARCH}/gen-disk-skus-map ./pkg/tool/
 
 .PHONY: unit-test
-unit-test: unit-test
+unit-test: unit-test unit-test-v2
 
 .PHONY: unit-test
 unit-test:
