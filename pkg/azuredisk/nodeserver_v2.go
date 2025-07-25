@@ -1,3 +1,6 @@
+//go:build azurediskv2
+// +build azurediskv2
+
 /*
 Copyright 2017 The Kubernetes Authors.
 
@@ -28,8 +31,6 @@ import (
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/optimization"
 	volumehelper "sigs.k8s.io/azuredisk-csi-driver/pkg/util"
 	azcache "sigs.k8s.io/cloud-provider-azure/pkg/cache"
-	"sigs.k8s.io/cloud-provider-azure/pkg/metrics"
-	azure "sigs.k8s.io/cloud-provider-azure/pkg/provider"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
 	"google.golang.org/grpc/codes"
@@ -43,23 +44,8 @@ import (
 	"sigs.k8s.io/azuredisk-csi-driver/pkg/azureutils"
 )
 
-const (
-	defaultLinuxFsType              = "ext4"
-	defaultWindowsFsType            = "ntfs"
-	defaultAzureVolumeLimit         = 16
-	volumeOperationAlreadyExistsFmt = "An operation with the given Volume ID %s already exists"
-)
-
-func getDefaultFsType() string {
-	if runtime.GOOS == "windows" {
-		return defaultWindowsFsType
-	}
-
-	return defaultLinuxFsType
-}
-
 // NodeStageVolume mount disk device to a staging path
-func (d *Driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
+func (d *DriverV2) NodeStageVolume(ctx context.Context, req *csi.NodeStageVolumeRequest) (*csi.NodeStageVolumeResponse, error) {
 	diskURI := req.GetVolumeId()
 	if len(diskURI) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -84,12 +70,6 @@ func (d *Driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequ
 	if err := azureutils.IsValidVolumeCapabilities([]*csi.VolumeCapability{volumeCapability}, maxShares); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
-
-	mc := metrics.NewMetricContext(consts.AzureDiskCSIDriverName, "node_stage_volume", d.cloud.ResourceGroup, "", d.Name)
-	isOperationSucceeded := false
-	defer func() {
-		mc.ObserveOperationWithResult(isOperationSucceeded, consts.VolumeID, diskURI)
-	}()
 
 	if acquired := d.volumeLocks.TryAcquire(diskURI); !acquired {
 		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, diskURI)
@@ -120,7 +100,7 @@ func (d *Driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequ
 				return nil, status.Errorf(codes.Internal, "failed to optimize device performance for target(%s) error(%s)", source, err)
 			}
 		} else {
-			klog.V(6).Infof("NodeStageVolume: perf optimization is disabled for %s. perfProfile %s accountType %s", source, profile, accountType)
+			klog.V(2).Infof("NodeStageVolume: perf optimization is disabled for %s. perfProfile %s accountType %s", source, profile, accountType)
 		}
 	}
 
@@ -146,7 +126,7 @@ func (d *Driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequ
 		if mnt.FsType != "" {
 			fstype = mnt.FsType
 		}
-		options = append(options, collectMountOptions(fstype, mnt.MountFlags)...)
+		options = append(options, mnt.MountFlags...)
 	}
 
 	volContextFSType := azureutils.GetFStype(req.GetVolumeContext())
@@ -172,8 +152,6 @@ func (d *Driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequ
 		needResize = true
 	}
 	if !needResize {
-		// Filesystem resize is required after snapshot restore / volume clone
-		// https://github.com/kubernetes/kubernetes/issues/94929
 		if needResize, err = needResizeVolume(source, target, d.mounter); err != nil {
 			klog.Errorf("NodeStageVolume: could not determine if volume %s needs to be resized: %v", diskURI, err)
 		}
@@ -187,12 +165,11 @@ func (d *Driver) NodeStageVolume(_ context.Context, req *csi.NodeStageVolumeRequ
 		}
 		klog.V(2).Infof("NodeStageVolume: fs resize successful on target(%s) volumeid(%s).", target, diskURI)
 	}
-	isOperationSucceeded = true
 	return &csi.NodeStageVolumeResponse{}, nil
 }
 
 // NodeUnstageVolume unmount disk device from a staging path
-func (d *Driver) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
+func (d *DriverV2) NodeUnstageVolume(ctx context.Context, req *csi.NodeUnstageVolumeRequest) (*csi.NodeUnstageVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -203,29 +180,23 @@ func (d *Driver) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstageVolume
 		return nil, status.Error(codes.InvalidArgument, "Staging target not provided")
 	}
 
-	mc := metrics.NewMetricContext(consts.AzureDiskCSIDriverName, "node_unstage_volume", d.cloud.ResourceGroup, "", d.Name)
-	isOperationSucceeded := false
-	defer func() {
-		mc.ObserveOperationWithResult(isOperationSucceeded, consts.VolumeID, volumeID)
-	}()
-
 	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
 		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
 	}
 	defer d.volumeLocks.Release(volumeID)
 
 	klog.V(2).Infof("NodeUnstageVolume: unmounting %s", stagingTargetPath)
-	if err := CleanupMountPoint(stagingTargetPath, d.mounter, true /*extensiveMountPointCheck*/); err != nil {
+	err := CleanupMountPoint(stagingTargetPath, d.mounter, false)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to unmount staging target %q: %v", stagingTargetPath, err)
 	}
 	klog.V(2).Infof("NodeUnstageVolume: unmount %s successfully", stagingTargetPath)
 
-	isOperationSucceeded = true
 	return &csi.NodeUnstageVolumeResponse{}, nil
 }
 
 // NodePublishVolume mount the volume from staging to target path
-func (d *Driver) NodePublishVolume(_ context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
+func (d *DriverV2) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in the request")
@@ -260,6 +231,11 @@ func (d *Driver) NodePublishVolume(_ context.Context, req *csi.NodePublishVolume
 	if err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("Target path could not be prepared: %v", err))
 	}
+
+	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
+		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
+	}
+	defer d.volumeLocks.Release(volumeID)
 
 	mountOptions := []string{"bind"}
 	if req.GetReadonly() {
@@ -303,10 +279,9 @@ func (d *Driver) NodePublishVolume(_ context.Context, req *csi.NodePublishVolume
 }
 
 // NodeUnpublishVolume unmount the volume from the target path
-func (d *Driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
+func (d *DriverV2) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
 	targetPath := req.GetTargetPath()
 	volumeID := req.GetVolumeId()
-
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID missing in the request")
 	}
@@ -315,14 +290,15 @@ func (d *Driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 	}
 
 	klog.V(2).Infof("NodeUnpublishVolume: unmounting volume %s on %s", volumeID, targetPath)
-	extensiveMountPointCheck := true
-	if runtime.GOOS == "windows" {
-		// on Windows, this parameter indicates whether to unmount volume, not necessary in NodeUnpublishVolume
-		extensiveMountPointCheck = false
-	}
-	if err := CleanupMountPoint(targetPath, d.mounter, extensiveMountPointCheck); err != nil {
+	err := CleanupMountPoint(targetPath, d.mounter, false)
+	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to unmount target %q: %v", targetPath, err)
 	}
+
+	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
+		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
+	}
+	defer d.volumeLocks.Release(volumeID)
 
 	klog.V(2).Infof("NodeUnpublishVolume: unmount volume %s on %s successfully", volumeID, targetPath)
 
@@ -330,14 +306,14 @@ func (d *Driver) NodeUnpublishVolume(_ context.Context, req *csi.NodeUnpublishVo
 }
 
 // NodeGetCapabilities return the capabilities of the Node plugin
-func (d *Driver) NodeGetCapabilities(_ context.Context, _ *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
+func (d *DriverV2) NodeGetCapabilities(ctx context.Context, req *csi.NodeGetCapabilitiesRequest) (*csi.NodeGetCapabilitiesResponse, error) {
 	return &csi.NodeGetCapabilitiesResponse{
 		Capabilities: d.NSCap,
 	}, nil
 }
 
 // NodeGetInfo return info of the node on which this plugin is running
-func (d *Driver) NodeGetInfo(ctx context.Context, _ *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
+func (d *DriverV2) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoRequest) (*csi.NodeGetInfoResponse, error) {
 	topology := &csi.Topology{
 		Segments: map[string]string{topologyKey: ""},
 	}
@@ -348,7 +324,7 @@ func (d *Driver) NodeGetInfo(ctx context.Context, _ *csi.NodeGetInfoRequest) (*c
 	if d.supportZone {
 		var zone cloudprovider.Zone
 		if d.getNodeInfoFromLabels {
-			failureDomainFromLabels, instanceTypeFromLabels, err = getNodeInfoFromLabels(ctx, d.NodeID, d.cloud.KubeClient)
+			failureDomainFromLabels, instanceTypeFromLabels, err = GetNodeInfoFromLabels(ctx, d.NodeID, d.cloud.KubeClient)
 		} else {
 			if runtime.GOOS == "windows" && (!d.cloud.UseInstanceMetadata || d.cloud.Metadata == nil) {
 				zone, err = d.cloud.VMSet.GetZoneByNodeName(ctx, d.NodeID)
@@ -357,7 +333,7 @@ func (d *Driver) NodeGetInfo(ctx context.Context, _ *csi.NodeGetInfoRequest) (*c
 			}
 			if err != nil {
 				klog.Warningf("get zone(%s) failed with: %v, fall back to get zone from node labels", d.NodeID, err)
-				failureDomainFromLabels, instanceTypeFromLabels, err = getNodeInfoFromLabels(ctx, d.NodeID, d.cloud.KubeClient)
+				failureDomainFromLabels, instanceTypeFromLabels, err = GetNodeInfoFromLabels(ctx, d.NodeID, d.cloud.KubeClient)
 			}
 		}
 		if err != nil {
@@ -380,15 +356,14 @@ func (d *Driver) NodeGetInfo(ctx context.Context, _ *csi.NodeGetInfoRequest) (*c
 		var err error
 		if d.getNodeInfoFromLabels {
 			if instanceTypeFromLabels == "" {
-				_, instanceTypeFromLabels, err = getNodeInfoFromLabels(ctx, d.NodeID, d.cloud.KubeClient)
+				_, instanceTypeFromLabels, err = GetNodeInfoFromLabels(ctx, d.NodeID, d.cloud.KubeClient)
 			}
 		} else {
 			if runtime.GOOS == "windows" && d.cloud.UseInstanceMetadata && d.cloud.Metadata != nil {
-				var metadata *azure.InstanceMetadata
-				metadata, err = d.cloud.Metadata.GetMetadata(ctx, azcache.CacheReadTypeDefault)
-				if err == nil && metadata != nil && metadata.Compute != nil {
+				metadata, err := d.cloud.Metadata.GetMetadata(ctx, azcache.CacheReadTypeDefault)
+				if err == nil && metadata.Compute != nil {
 					instanceType = metadata.Compute.VMSize
-					klog.V(2).Infof("NodeGetInfo: nodeName(%s), VM Size(%s)", d.NodeID, instanceType)
+					klog.V(5).Infof("NodeGetInfo: nodeName(%s), VM Size(%s)", d.NodeID, instanceType)
 				}
 			} else {
 				instances, ok := d.cloud.Instances()
@@ -403,7 +378,7 @@ func (d *Driver) NodeGetInfo(ctx context.Context, _ *csi.NodeGetInfoRequest) (*c
 			}
 			if instanceType == "" && instanceTypeFromLabels == "" {
 				klog.Warningf("fall back to get instance type from node labels")
-				_, instanceTypeFromLabels, err = getNodeInfoFromLabels(ctx, d.NodeID, d.cloud.KubeClient)
+				_, instanceTypeFromLabels, err = GetNodeInfoFromLabels(ctx, d.NodeID, d.cloud.KubeClient)
 			}
 		}
 		if err != nil {
@@ -412,56 +387,17 @@ func (d *Driver) NodeGetInfo(ctx context.Context, _ *csi.NodeGetInfoRequest) (*c
 		if instanceType == "" {
 			instanceType = instanceTypeFromLabels
 		}
-		totalDiskDataCount, _ := getMaxDataDiskCount(instanceType)
-		maxDataDiskCount = totalDiskDataCount - d.ReservedDataDiskSlotNum
-	}
-
-	nodeID := d.NodeID
-	if d.getNodeIDFromIMDS && d.cloud.UseInstanceMetadata && d.cloud.Metadata != nil {
-		metadata, err := d.cloud.Metadata.GetMetadata(ctx, azcache.CacheReadTypeDefault)
-		if err == nil && metadata != nil && metadata.Compute != nil {
-			klog.V(2).Infof("NodeGetInfo: NodeID(%s), metadata.Compute.Name(%s)", d.NodeID, metadata.Compute.Name)
-			if metadata.Compute.Name != "" {
-				if metadata.Compute.VMScaleSetName != "" {
-					id, err := getVMSSInstanceName(metadata.Compute.Name)
-					if err != nil {
-						klog.Errorf("getVMSSInstanceName failed with %v", err)
-						if nodeID == "" {
-							klog.V(2).Infof("NodeGetInfo: NodeID is empty, use metadata.Compute.Name(%s)", metadata.Compute.Name)
-							nodeID = metadata.Compute.Name
-						}
-					} else {
-						nodeID = id
-					}
-				} else {
-					nodeID = metadata.Compute.Name
-				}
-			}
-		} else {
-			klog.Warningf("get instance type(%s) failed with: %v", d.NodeID, err)
-		}
+		maxDataDiskCount, _ = GetMaxDataDiskCount(instanceType)
 	}
 
 	return &csi.NodeGetInfoResponse{
-		NodeId:             nodeID,
+		NodeId:             d.NodeID,
 		MaxVolumesPerNode:  maxDataDiskCount,
 		AccessibleTopology: topology,
 	}, nil
 }
 
-func getMaxDataDiskCount(instanceType string) (int64, bool) {
-	vmsize := strings.ToUpper(instanceType)
-	maxDataDiskCount, exists := maxDataDiskCountMap[vmsize]
-	if exists {
-		klog.V(5).Infof("got a matching size in getMaxDataDiskCount, VM Size: %s, MaxDataDiskCount: %d", vmsize, maxDataDiskCount)
-		return maxDataDiskCount, true
-	}
-
-	klog.V(5).Infof("not found a matching size in getMaxDataDiskCount, VM Size: %s, use default volume limit: %d", vmsize, defaultAzureVolumeLimit)
-	return defaultAzureVolumeLimit, false
-}
-
-func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
+func (d *DriverV2) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
 	if len(req.VolumeId) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "NodeGetVolumeStats volume ID was empty")
 	}
@@ -470,16 +406,13 @@ func (d *Driver) NodeGetVolumeStats(ctx context.Context, req *csi.NodeGetVolumeS
 	}
 
 	volUsage, err := d.GetVolumeStats(ctx, d.mounter, req.VolumeId, req.VolumePath, d.hostUtil)
-	if err != nil {
-		klog.Errorf("NodeGetVolumeStats: failed to get volume stats for volume %s path %s: %v", req.VolumeId, req.VolumePath, err)
-	}
 	return &csi.NodeGetVolumeStatsResponse{
 		Usage: volUsage,
 	}, err
 }
 
 // NodeExpandVolume node expand volume
-func (d *Driver) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
+func (d *DriverV2) NodeExpandVolume(ctx context.Context, req *csi.NodeExpandVolumeRequest) (*csi.NodeExpandVolumeResponse, error) {
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
@@ -515,12 +448,6 @@ func (d *Driver) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRe
 		return &csi.NodeExpandVolumeResponse{}, nil
 	}
 
-	mc := metrics.NewMetricContext(consts.AzureDiskCSIDriverName, "node_expand_volume", d.cloud.ResourceGroup, "", d.Name)
-	isOperationSucceeded := false
-	defer func() {
-		mc.ObserveOperationWithResult(isOperationSucceeded, consts.VolumeID, volumeID)
-	}()
-
 	if acquired := d.volumeLocks.TryAcquire(volumeID); !acquired {
 		return nil, status.Errorf(codes.Aborted, volumeOperationAlreadyExistsFmt, volumeID)
 	}
@@ -544,10 +471,6 @@ func (d *Driver) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRe
 		klog.Errorf("%v, will continue checking whether the volume has been resized", retErr)
 	}
 
-	if runtime.GOOS == "windows" && d.enableWindowsHostProcess {
-		// in windows host process mode, this driver could get the volume size from the volume path
-		devicePath = volumePath
-	}
 	gotBlockSizeBytes, err := getBlockSizeBytes(devicePath, d.mounter)
 	if err != nil {
 		return nil, status.Error(codes.Internal, fmt.Sprintf("could not get size of block volume at path %s: %v", devicePath, err))
@@ -560,10 +483,8 @@ func (d *Driver) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRe
 		// Because size was rounded up, getting more size than requested will be a success.
 		return nil, status.Errorf(codes.Internal, "resize requested for %v, but after resizing volume size was %v", requestGiB, gotBlockGiB)
 	}
-
 	klog.V(2).Infof("NodeExpandVolume succeeded on resizing volume %v to %v", volumeID, gotBlockSizeBytes)
 
-	isOperationSucceeded = true
 	return &csi.NodeExpandVolumeResponse{
 		CapacityBytes: gotBlockSizeBytes,
 	}, nil
@@ -571,7 +492,7 @@ func (d *Driver) NodeExpandVolume(_ context.Context, req *csi.NodeExpandVolumeRe
 
 // ensureMountPoint: create mount point if not exists
 // return <true, nil> if it's already a mounted point otherwise return <false, nil>
-func (d *Driver) ensureMountPoint(target string) (bool, error) {
+func (d *DriverV2) ensureMountPoint(target string) (bool, error) {
 	notMnt, err := d.mounter.IsLikelyNotMountPoint(target)
 	if err != nil && !os.IsNotExist(err) {
 		if azureutils.IsCorruptedDir(target) {
@@ -631,11 +552,11 @@ func (d *Driver) ensureMountPoint(target string) (bool, error) {
 	return !notMnt, nil
 }
 
-func (d *Driver) formatAndMount(source, target, fstype string, options []string) error {
+func (d *DriverV2) formatAndMount(source, target, fstype string, options []string) error {
 	return formatAndMount(source, target, fstype, options, d.mounter)
 }
 
-func (d *Driver) getDevicePathWithLUN(lunStr string) (string, error) {
+func (d *DriverV2) getDevicePathWithLUN(lunStr string) (string, error) {
 	lun, err := azureutils.GetDiskLUN(lunStr)
 	if err != nil {
 		return "", err
@@ -663,7 +584,7 @@ func (d *Driver) getDevicePathWithLUN(lunStr string) (string, error) {
 	return newDevicePath, err
 }
 
-func (d *Driver) ensureBlockTargetFile(target string) error {
+func (d *DriverV2) ensureBlockTargetFile(target string) error {
 	// Since the block device target path is file, its parent directory should be ensured to be valid.
 	parentDir := filepath.Dir(target)
 	if _, err := d.ensureMountPoint(parentDir); err != nil {
@@ -680,16 +601,4 @@ func (d *Driver) ensureBlockTargetFile(target string) error {
 	}
 
 	return nil
-}
-
-func collectMountOptions(fsType string, mntFlags []string) []string {
-	var options []string
-	options = append(options, mntFlags...)
-
-	// By default, xfs does not allow mounting of two volumes with the same filesystem uuid.
-	// Force ignore this uuid to be able to mount volume + its clone / restored snapshot on the same node.
-	if fsType == "xfs" {
-		options = append(options, "nouuid")
-	}
-	return options
 }
